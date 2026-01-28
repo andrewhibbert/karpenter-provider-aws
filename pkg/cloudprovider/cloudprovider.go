@@ -32,6 +32,7 @@ import (
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
 	karpoptions "sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 
 	"github.com/aws/karpenter-provider-aws/pkg/apis"
@@ -142,8 +143,15 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if instance.CapacityType == karpv1.CapacityTypeReserved {
 		c.capacityReservationProvider.MarkLaunched(*instance.CapacityReservationID)
 	}
+	// When NodeOverlay feature is enabled, there may be multiple instance type variants with the same name.
+	// Find the variant that matches the nodeClaim's requirements to get the correct capacity.
+	nodeClaimReqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
 	instanceType, _ := lo.Find(instanceTypes, func(i *cloudprovider.InstanceType) bool {
-		return i.Name == string(instance.Type)
+		if i.Name != string(instance.Type) {
+			return false
+		}
+		// Check if this variant's requirements are compatible with the nodeClaim's requirements
+		return i.Requirements.Intersects(nodeClaimReqs) == nil
 	})
 	nc := c.instanceToNodeClaim(instance, instanceType, nodeClass)
 	nc.Annotations = lo.Assign(nc.Annotations, map[string]string{
@@ -210,6 +218,14 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
 	if err != nil {
 		return nil, err
+	}
+	// Apply NodeOverlay to add custom label requirements and capacity/pricing overlays
+	// Skip if the context signals to skip (e.g., when called from nodeoverlay controller)
+	if karpoptions.FromContext(ctx).FeatureGates.NodeOverlay && !cloudprovider.ShouldSkipNodeOverlay(ctx) {
+		instanceTypes, err = c.instanceTypeStore.ApplyAll(nodePool.Name, instanceTypes)
+		if err != nil {
+			return nil, fmt.Errorf("applying node overlay, %w", err)
+		}
 	}
 	return instanceTypes, nil
 }
